@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 from typing import Any
+
+import structlog
 
 from axon.core.events import Event
 from axon.core.results import AgentResult
 from axon.core.errors import AxonError
 from axon.llm.base import LLMProvider
+from axon.observability.logging import get_logger
 from axon.policies.agent_permissions import AGENT_PERMISSIONS
 from axon.stores.local_artifact_store import LocalArtifactStore
 from axon.stores.sqlite_state_store import SQLiteStateStore
+
+logger = get_logger(__name__)
 
 
 class BaseAgent(ABC):
@@ -80,7 +86,28 @@ class BaseAgent(ABC):
     def call_llm(self, prompt: str, system: str = "", max_tokens: int = 2048) -> str:
         if self._llm is None:
             raise AxonError(f"Agent '{self.name}' has no LLM provider configured.")
-        return self._llm.complete(system=system, user=prompt, max_tokens=max_tokens)
+        start = time.perf_counter()
+        try:
+            response = self._llm.complete(system=system, user=prompt, max_tokens=max_tokens)
+        except Exception as exc:
+            logger.warning(
+                "llm.call",
+                prompt_chars=len(prompt),
+                max_tokens=max_tokens,
+                ok=False,
+                error=str(exc),
+                latency_ms=round((time.perf_counter() - start) * 1000),
+            )
+            raise
+        logger.info(
+            "llm.call",
+            prompt_chars=len(prompt),
+            response_chars=len(response),
+            max_tokens=max_tokens,
+            ok=True,
+            latency_ms=round((time.perf_counter() - start) * 1000),
+        )
+        return response
 
     # ------------------------------------------------------------------ #
     # Template method                                                        #
@@ -88,6 +115,8 @@ class BaseAgent(ABC):
 
     def run(self, event: Event) -> AgentResult:
         self._check_permissions()
+        structlog.contextvars.bind_contextvars(agent=self.name)
+        logger.info("agent.started")
         try:
             context = self.load_context(event)
             prompt = self.build_prompt(context)
@@ -96,6 +125,7 @@ class BaseAgent(ABC):
             artifacts = self.persist_artifacts(validated, event)
             next_event = self.create_next_event(artifacts, context)
 
+            logger.info("agent.completed", status="success", next_event=next_event)
             return AgentResult(
                 status="success",
                 output_artifacts=artifacts,
@@ -105,11 +135,14 @@ class BaseAgent(ABC):
         except AxonError:
             raise
         except Exception as exc:
+            logger.error("agent.failed", error=str(exc))
             return AgentResult(
                 status="failed",
                 errors=[str(exc)],
                 human_approval_required=True,
             )
+        finally:
+            structlog.contextvars.unbind_contextvars("agent")
 
     def _check_permissions(self) -> None:
         allowed = AGENT_PERMISSIONS.get(self.name, [])

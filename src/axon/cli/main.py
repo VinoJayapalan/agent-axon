@@ -13,6 +13,7 @@ import sys
 from axon.config.settings import settings
 from axon.core.workflow import WorkflowSummary
 from axon.llm.claude import ClaudeProvider
+from axon.observability.logging import configure_logging
 from axon.orchestrator.engine import WorkflowEngine
 from axon.stores.local_artifact_store import LocalArtifactStore
 from axon.stores.sqlite_state_store import SQLiteStateStore
@@ -135,6 +136,24 @@ def cmd_approve(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 1
 
+    # If QA already issued a PASS/CONDITIONAL_PASS verdict, this approval finalizes
+    # the release (release notes, catalog refresh, DevOps/Prod checklists, DONE)
+    # rather than needlessly re-running SM/Dev/QA.
+    import json
+    qa_signoff_path = Path(settings.artifacts_base_path) / args.workflow_id / "qa" / "qa_signoff.json"
+    qa_verdict = None
+    if qa_signoff_path.exists():
+        try:
+            qa_verdict = json.loads(qa_signoff_path.read_text(encoding="utf-8")).get("verdict")
+        except Exception:
+            pass
+
+    if qa_verdict in ("PASS", "CONDITIONAL_PASS"):
+        print(f"  QA verdict already {qa_verdict} — finalizing release.")
+        summary = engine.finalize_approval(args.workflow_id)
+        _print_summary(summary)
+        return 0
+
     # Smart resume: if Dev artifacts already exist, jump straight to QA
     dev_dir = Path(settings.artifacts_base_path) / args.workflow_id / "dev"
     sm_ep = Path(settings.artifacts_base_path) / args.workflow_id / "sm" / "execution_plan.json"
@@ -147,7 +166,8 @@ def cmd_approve(args: argparse.Namespace) -> int:
     return 0 if not summary.human_approval_required else 2
 
 
-
+def cmd_status(args: argparse.Namespace) -> int:
+    """Check status of an existing workflow."""
     state_store = SQLiteStateStore(db_path=settings.axon_db_path)
     wf = state_store.get_workflow(args.workflow_id)
     if wf is None:
@@ -166,6 +186,7 @@ def cmd_approve(args: argparse.Namespace) -> int:
 # ─────────────────────────────────────────────────────────────────────────── #
 
 def main() -> None:
+    configure_logging()
     parser = argparse.ArgumentParser(
         prog="axon",
         description="Axon — agentic SDLC orchestration platform",

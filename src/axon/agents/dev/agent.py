@@ -1,25 +1,33 @@
 from __future__ import annotations
 
 import json
-import re
+from pathlib import Path
 from typing import Any
 
+import structlog
+
 from axon.agents.base import BaseAgent
-from axon.agents.dev.orchestrator import run_agent
+from axon.agents.dev.orchestrator import plan_and_edit, run_npm_install, slugify
 from axon.agents.dev.prompts import load_execution_plan
 from axon.agents.dev.schemas import DevOutput
 from axon.config.settings import settings
+from axon.core.artifacts import archive_agent_name
 from axon.core.events import Event, ArtifactRef
 from axon.core.results import AgentResult
+from axon.observability.logging import get_logger
+from axon.tools.git_tools import commit_changes, create_branch, push_branch
+from axon.tools.github_tools import create_pull_request
+from axon.tools.validator_tools import run_build
+
+logger = get_logger(__name__)
 
 
 class DevAgent(BaseAgent):
     """Developer Agent — wraps the full Agent Dave pipeline.
 
-    For each task in the SM execution plan:
-      - Calls orchestrator.run_agent(requirement)
-      - Parses the returned string for build status and PR URL
-      - Persists a structured DevOutput artifact per task
+    For each task in the SM execution plan, plans and applies file edits.
+    All tasks in a round are then built and shipped as a SINGLE branch/commit/PR,
+    instead of one PR per task.
     """
 
     @property
@@ -36,7 +44,7 @@ class DevAgent(BaseAgent):
 
     def load_context(self, event: Event) -> dict[str, Any]:
         tasks = load_execution_plan(settings.artifacts_base_path, event.workflow_id)
-        return {"tasks": tasks, "workflow_id": event.workflow_id}
+        return {"tasks": tasks, "workflow_id": event.workflow_id, "retry_count": event.retry_count}
 
     def build_prompt(self, context: dict[str, Any]) -> str:
         return ""  # Dev Agent does not call LLM directly
@@ -51,66 +59,123 @@ class DevAgent(BaseAgent):
         return "dev.all_tasks_complete"
 
     # ------------------------------------------------------------------ #
-    # Override run() — iterate tasks, one run_agent() call per task         #
+    # Override run() — plan+edit every task, then ONE build + ONE PR        #
     # ------------------------------------------------------------------ #
 
     def run(self, event: Event) -> AgentResult:
         self._check_permissions()
+        structlog.contextvars.bind_contextvars(agent=self.name)
+        logger.info("agent.started")
+        try:
+            return self._run(event)
+        finally:
+            structlog.contextvars.unbind_contextvars("agent")
+
+    def _run(self, event: Event) -> AgentResult:
         context = self.load_context(event)
         tasks: list[str] = context.get("tasks", [])
         workflow_id: str = context.get("workflow_id", event.workflow_id)
+        round_n: int = context.get("retry_count", 0)
 
         if not tasks:
+            logger.error("agent.failed", error="No tasks found in SM execution_plan.json")
             return AgentResult(
                 status="failed",
                 errors=["No tasks found in SM execution_plan.json"],
                 human_approval_required=True,
             )
 
-        all_artifacts: list[ArtifactRef] = []
-        all_outputs: list[DevOutput] = []
-        any_failure = False
+        task_plans: list[dict[str, Any]] = []
+        all_edited_files: list[str] = []
 
         for i, requirement in enumerate(tasks):
             task_id = f"task_{i + 1}"
-            print(f"\n[Dev Agent] Running task {i + 1}/{len(tasks)}: {requirement[:80]}")
-
+            structlog.contextvars.bind_contextvars(task_id=task_id)
+            logger.info("dev.task_started", requirement_preview=requirement[:80], task_index=i + 1, task_count=len(tasks))
             try:
-                raw_output = run_agent(requirement)
+                result = plan_and_edit(requirement)
             except Exception as exc:
-                dev_out = DevOutput(
-                    task_id=task_id,
-                    requirement=requirement,
-                    error_message=str(exc),
-                    human_review_required=True,
-                    raw_output="",
-                )
-                any_failure = True
-            else:
-                dev_out = self._parse_run_agent_output(raw_output, task_id, requirement)
-                if not dev_out.build_passed:
-                    any_failure = True
+                logger.error("dev.task_failed", error=str(exc))
+                task_plans.append({
+                    "task_id": task_id, "requirement": requirement,
+                    "plan_summary": "", "relevant_files": [], "edited_files": [],
+                    "error": str(exc),
+                })
+                continue
+            finally:
+                structlog.contextvars.unbind_contextvars("task_id")
 
-            all_outputs.append(dev_out)
-            ref = self._artifact_store.save(
-                workflow_id=workflow_id,
-                agent_name="dev",
-                artifact_name=f"dev_output_{task_id}.json",
-                content=dev_out.model_dump_json(indent=2),
+            logger.info("dev.task_completed", edited_files=len(result.edited_files))
+            task_plans.append({
+                "task_id": task_id, "requirement": requirement,
+                "plan_summary": result.plan_summary, "relevant_files": result.relevant_files,
+                "edited_files": result.edited_files, "error": None,
+            })
+            for f in result.edited_files:
+                if f not in all_edited_files:
+                    all_edited_files.append(f)
+
+        build_passed = True
+        build_error: str | None = None
+        pr_url: str | None = None
+
+        if all_edited_files:
+            if any("package.json" in f and "lock" not in f for f in all_edited_files):
+                install_error = run_npm_install(settings.target_repo_path)
+                if install_error:
+                    build_passed = False
+                    build_error = f"npm install failed:\n{install_error}"
+
+            if build_passed:
+                logger.info("dev.build_started")
+                build = run_build(settings.target_repo_path)
+                build_passed = build.success
+                if not build_passed:
+                    build_error = f"{build.error}\n{build.output}".strip()
+
+            if build_passed:
+                pr_url, pr_error = self._ship_single_pr(workflow_id, round_n, tasks, task_plans, all_edited_files)
+                if pr_error:
+                    build_error = pr_error
+
+        all_artifacts: list[ArtifactRef] = []
+        any_task_error = False
+        for tp in task_plans:
+            if tp["error"]:
+                any_task_error = True
+            dev_out = DevOutput(
+                task_id=tp["task_id"],
+                requirement=tp["requirement"],
+                plan_summary=tp["plan_summary"],
+                relevant_files=tp["relevant_files"],
+                edits_applied=tp["edited_files"],
+                build_passed=build_passed,
+                pr_url=pr_url,
+                error_message=tp["error"] or (build_error if not build_passed else None),
+                human_review_required=bool(tp["error"]) or not build_passed,
+                raw_output="",
             )
+            name = f"dev_output_{tp['task_id']}.json"
+            content = dev_out.model_dump_json(indent=2)
+            ref = self._artifact_store.save(workflow_id, "dev", name, content)
             all_artifacts.append(ref)
+            # Archive a per-round snapshot so a later retry round doesn't erase this round's outputs.
+            self._artifact_store.save(workflow_id, archive_agent_name("dev", round_n), name, content)
 
-        if any_failure:
-            # Build failures are handed to QA as defects rather than hard-stopping.
-            # Human approval is required at QA_COMPLETED regardless.
+        if any_task_error or not build_passed:
+            errors = [tp["error"] for tp in task_plans if tp["error"]]
+            if build_error:
+                errors.append(build_error)
+            logger.info("agent.completed", status="success", build_passed=build_passed, any_task_error=any_task_error)
             return AgentResult(
                 status="success",
                 output_artifacts=all_artifacts,
                 next_event="dev.all_tasks_complete",
-                errors=[o.error_message for o in all_outputs if o.error_message],
+                errors=errors,
                 human_approval_required=False,
             )
 
+        logger.info("agent.completed", status="success", build_passed=True, pr_url=pr_url)
         return AgentResult(
             status="success",
             output_artifacts=all_artifacts,
@@ -118,57 +183,62 @@ class DevAgent(BaseAgent):
         )
 
     # ------------------------------------------------------------------ #
-    # Parser: run_agent() string → DevOutput                                #
+    # Ship all edits from this round as a single branch/commit/PR           #
     # ------------------------------------------------------------------ #
 
-    @staticmethod
-    def _parse_run_agent_output(raw: str, task_id: str, requirement: str) -> DevOutput:
-        build_passed = "Build: ✅ PASSED" in raw
-        build_failed = "Build: ❌ FAILED" in raw
+    def _ship_single_pr(
+        self,
+        workflow_id: str,
+        round_n: int,
+        tasks: list[str],
+        task_plans: list[dict[str, Any]],
+        edited_files: list[str],
+    ) -> tuple[str | None, str | None]:
+        target = settings.target_repo_path
+        raw_request = self._load_raw_request(workflow_id)
+        title_source = raw_request or tasks[0]
 
-        pr_url: str | None = None
-        pr_match = re.search(r"Pull request opened:\s*(https?://\S+)", raw)
-        if pr_match:
-            pr_url = pr_match.group(1)
+        branch_name = slugify(title_source)
+        if round_n:
+            branch_name = f"{branch_name}-r{round_n}"
+        commit_msg = f"feat: {title_source[:72]}"
 
-        plan_summary = ""
-        plan_match = re.search(r"Plan summary:\s*(.+?)(?:\n\n|\Z)", raw, re.DOTALL)
-        if plan_match:
-            plan_summary = plan_match.group(1).strip()
+        body_sections = [f"## Requirement\n{raw_request or title_source}\n"]
+        for tp in task_plans:
+            if tp["edited_files"]:
+                body_sections.append(
+                    f"### {tp['task_id']}\n{tp['plan_summary']}\n"
+                    + "\n".join(f"- `{f}`" for f in tp["edited_files"])
+                )
+        pr_body = "\n\n".join(body_sections) + "\n\n_Opened by Axon_"
 
-        relevant_files: list[str] = []
-        files_match = re.search(r"Relevant files:\n(.*?)(?:\n\n|\Z)", raw, re.DOTALL)
-        if files_match:
-            relevant_files = [
-                f.strip() for f in files_match.group(1).splitlines() if f.strip()
-            ]
+        print(f"Creating branch: {branch_name}")
+        branch_result = create_branch(target, branch_name)
+        if not branch_result.success:
+            return None, f"Git branch failed: {branch_result.error}"
 
-        edits_applied: list[str] = []
-        edits_match = re.search(r"Edits applied to:\n(.*?)(?:\n\n|\Z)", raw, re.DOTALL)
-        if edits_match:
-            edits_applied = [
-                f.strip().lstrip("  ") for f in edits_match.group(1).splitlines() if f.strip()
-            ]
+        print("Committing changes...")
+        commit_result = commit_changes(target, edited_files, commit_msg)
+        if not commit_result.success:
+            return None, f"Git commit failed: {commit_result.error}"
 
-        error_message: str | None = None
-        if build_failed:
-            err_match = re.search(r"Build errors:\n(.*?)(?:\n\n|\Z)", raw, re.DOTALL)
-            error_message = err_match.group(1).strip() if err_match else "Build failed"
+        print(f"Pushing branch: {branch_name}")
+        push_result = push_branch(target, branch_name)
+        if not push_result.success:
+            return None, f"Git push failed: {push_result.error}"
 
-        if not edits_applied and not build_failed:
-            no_edits = "No file edits were applied" in raw
-            if no_edits:
-                build_passed = True  # No changes needed — treat as success
-
-        return DevOutput(
-            task_id=task_id,
-            requirement=requirement,
-            plan_summary=plan_summary,
-            relevant_files=relevant_files,
-            edits_applied=edits_applied,
-            build_passed=build_passed,
-            pr_url=pr_url,
-            error_message=error_message,
-            human_review_required=build_failed,
-            raw_output=raw,
+        print("Opening pull request...")
+        pr = create_pull_request(
+            title=f"feat: {title_source[:72]}",
+            body=pr_body,
+            branch=branch_name,
         )
+        return pr.url, None
+
+    @staticmethod
+    def _load_raw_request(workflow_id: str) -> str:
+        path = Path(settings.artifacts_base_path) / workflow_id / "engine" / "raw_request.txt"
+        if path.exists():
+            return path.read_text(encoding="utf-8").strip()
+        return ""
+

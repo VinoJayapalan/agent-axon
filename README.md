@@ -23,7 +23,7 @@ git clone <repo>
 cd agent-axon
 
 # 2. Virtual environment
-python3.11 -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 
 # 3. Install package
@@ -48,6 +48,8 @@ cp .env.example .env
 | `GITHUB_BASE_BRANCH` | | Base branch for PRs (default: `main`) |
 | `AXON_DB_PATH` | | SQLite DB path (default: `data/axon.db`) |
 | `ARTIFACTS_BASE_PATH` | | Artifact root (default: `artifacts/`) |
+| `AXON_LOG_FORMAT` | | Console log format: `console` (default) or `json` |
+| `AXON_LOG_LEVEL` | | Log level (default: `INFO`) |
 
 ---
 
@@ -138,13 +140,18 @@ For each requirement string in the execution plan:
 - Runs `npm test` on the target repo
 - Asks Claude to analyse test results against the sprint goal
 - Issues a **verdict**: `PASS` / `CONDITIONAL_PASS` / `FAIL`
+- If `npm test` fails due to a broken test **environment** (missing script, module not found, etc.)
+  rather than a code defect, QA escalates immediately to human approval instead of consuming
+  the SM/Dev retry on a problem Dev Agent cannot fix
 - `FAIL` on first attempt → SM replan (QA defect report fed back to SM)
 - `FAIL` on second attempt → escalate to human
 - Any `PASS` → pauses for human approval
 
 ### 5. Human Approval Gate
 The pipeline always stops at `HUMAN_APPROVAL_REQUIRED` before any release action.
-Run `axon approve <id>` to advance (or inspect artifacts and reject).
+Run `axon approve <id>` to advance (or inspect artifacts and reject). If QA already passed,
+approval finalizes the release directly: generates release notes, refreshes the product
+catalog, runs the (gated) DevOps/Prod placeholder checks, and marks the workflow `DONE`.
 
 ### 6. DevOps / Prod Agents (Placeholder)
 Return deployment readiness checklists and release gate information.
@@ -158,16 +165,32 @@ Every workflow writes structured JSON artifacts:
 
 ```
 artifacts/<workflow-id>/
-  engine/  raw_request.txt
+  engine/  raw_request.txt  run.log.jsonl
   po/      prd.json  user_stories.json  acceptance_criteria.json
            feasibility_report.json  open_questions.json
   sm/      sprint_goal.json  task_breakdown.json  execution_plan.json
            dependency_graph.json  risk_notes.json
+           history/round{N}/  ← per-retry-round snapshot (never overwritten)
   dev/     dev_output_task_1.json  …  dev_output_task_N.json
+           history/round{N}/  ← per-retry-round snapshot (never overwritten)
   qa/      test_cases.json  test_results.json  defect_report.json  qa_signoff.json
+           history/round{N}/  ← per-retry-round snapshot (never overwritten)
 ```
 
 Workflow state is also persisted to `data/axon.db` (SQLite).
+
+---
+
+## Observability / Logs
+
+Every run emits structured logs via `structlog`:
+
+- **Console** — human-readable by default (`AXON_LOG_FORMAT=console`), or JSON (`AXON_LOG_FORMAT=json`).
+- **Per-workflow JSON file** — `artifacts/<workflow-id>/engine/run.log.jsonl`, written automatically
+  once a workflow starts. Contains every state transition, agent start/complete/fail, LLM call
+  (length + latency, never prompt/response content), tool invocation (shell/git/GitHub/build, never
+  credentials), and artifact write for that specific workflow — useful for reconstructing exactly
+  what happened without piecing it together from individual JSON artifacts.
 
 ---
 
@@ -190,6 +213,7 @@ src/axon/
   agents/       PO, SM, Dev, QA, DevOps, Prod
   core/         Domain models (Event, WorkflowState, AgentResult, errors)
   llm/          LLMProvider port + ClaudeProvider adapter
+  observability/ structlog configuration, context binding, redaction
   stores/       ArtifactStore + StateStore ports + SQLite/local adapters
   policies/     Command allowlist, approval logic, agent permissions
   tools/        File I/O, git, GitHub, repo scan, build validation

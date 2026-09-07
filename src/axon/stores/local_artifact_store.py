@@ -5,6 +5,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from axon.core.events import ArtifactRef
+from axon.observability.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class LocalArtifactStore:
@@ -27,6 +30,7 @@ class LocalArtifactStore:
         target = self._base / workflow_id / agent_name / artifact_name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
+        logger.info("artifact.saved", path=str(target), bytes=len(content.encode("utf-8")))
 
         return ArtifactRef(
             artifact_id=str(uuid.uuid4()),

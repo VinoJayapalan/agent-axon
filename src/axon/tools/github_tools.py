@@ -3,6 +3,9 @@ from dataclasses import dataclass
 import requests
 
 from axon.config.settings import GITHUB_BASE_BRANCH, GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN
+from axon.observability.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -38,9 +41,11 @@ def create_pull_request(title: str, body: str, branch: str) -> PullRequest:
             message = response.json().get("message", response.text)
         except Exception:
             message = response.text
+        logger.warning("tool.invoked", tool="github_create_pr", success=False, status_code=response.status_code)
         raise RuntimeError(f"GitHub API error {response.status_code}: {message}")
 
     data = response.json()
+    logger.info("tool.invoked", tool="github_create_pr", success=True, pr_number=data["number"])
     return PullRequest(
         url=data["html_url"],
         number=data["number"],

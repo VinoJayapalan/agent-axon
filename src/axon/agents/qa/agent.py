@@ -4,14 +4,29 @@ import json
 from pathlib import Path
 from typing import Any
 
+import structlog
+
 from axon.agents.base import BaseAgent
 from axon.agents.qa.prompts import QA_SYSTEM, QA_ANALYSIS_SYSTEM
 from axon.agents.qa.schemas import QAOutput, TestCase, Defect
 from axon.config.settings import settings
+from axon.core.artifacts import archive_agent_name
 from axon.core.errors import LLMValidationError
 from axon.core.events import Event
+from axon.observability.logging import get_logger
 from axon.tools.file_tools import write_file
 from axon.tools.shell_executor import ShellExecutor
+
+logger = get_logger(__name__)
+
+# Substrings in test-runner stderr that indicate a broken test environment,
+# not a code defect (e.g. the target repo has no "test" script configured).
+_ENV_ISSUE_MARKERS = ("missing script", "command not found", "enoent", "cannot find module")
+
+
+def _is_test_env_issue(test_results: dict) -> bool:
+    error_text = (test_results.get("error") or "").lower()
+    return any(marker in error_text for marker in _ENV_ISSUE_MARKERS)
 
 
 class QAAgent(BaseAgent):
@@ -94,6 +109,8 @@ Generate at most 5 concise test cases. Keep test_content under 20 lines each."""
 
     def run(self, event: Event) -> Any:
         self._check_permissions()
+        structlog.contextvars.bind_contextvars(agent=self.name)
+        logger.info("agent.started")
         from axon.core.results import AgentResult
 
         context = self.load_context(event)
@@ -115,7 +132,7 @@ Generate at most 5 concise test cases. Keep test_content under 20 lines each."""
                         test_files_written.append(tc["test_file_path"])
 
             # Phase 2b: run npm test
-            test_results = {"passed": 0, "failed": 0, "output": "", "success": False}
+            test_results = {"passed": 0, "failed": 0, "output": "", "error": "", "success": False}
             if settings.target_repo_path:
                 try:
                     executor = ShellExecutor(cwd=settings.target_repo_path)
@@ -128,10 +145,11 @@ Generate at most 5 concise test cases. Keep test_content under 20 lines each."""
                         "passed": passed,
                         "failed": failed,
                         "output": shell_result.output[:2000],
+                        "error": shell_result.error[:2000],
                         "success": shell_result.success,
                     }
                 except Exception as exc:
-                    test_results["output"] = str(exc)
+                    test_results["error"] = str(exc)
 
             # Phase 3: analyse results
             analysis_prompt = f"""Test results:
@@ -148,21 +166,36 @@ Classify defects, validate DoD, and produce verdict."""
             analysis = _safe_json(raw2)
 
             verdict = analysis.get("verdict", "FAIL" if not test_results["success"] else "PASS")
+            env_issue = _is_test_env_issue(test_results)
 
-            # Persist all artifacts
+            # Persist all artifacts (canonical + a per-round archival copy so retries don't overwrite history)
+            round_n = context.get("retry_count", 0)
             refs = []
-            refs.append(self._artifact_store.save(wf, "qa", "test_cases.json",
-                                                   json.dumps(validated.get("test_cases", []), indent=2)))
-            refs.append(self._artifact_store.save(wf, "qa", "test_results.json",
-                                                   json.dumps(test_results, indent=2)))
-            refs.append(self._artifact_store.save(wf, "qa", "defect_report.json",
-                                                   json.dumps(analysis.get("defect_report", []), indent=2)))
-            refs.append(self._artifact_store.save(wf, "qa", "qa_signoff.json",
-                                                   json.dumps(analysis, indent=2)))
+            for name, payload in [
+                ("test_cases.json", validated.get("test_cases", [])),
+                ("test_results.json", test_results),
+                ("defect_report.json", analysis.get("defect_report", [])),
+                ("qa_signoff.json", analysis),
+            ]:
+                content = json.dumps(payload, indent=2)
+                refs.append(self._artifact_store.save(wf, "qa", name, content))
+                self._artifact_store.save(wf, archive_agent_name("qa", round_n), name, content)
 
-            retry = context.get("retry_count", 0)
+            if env_issue:
+                # A broken test environment is not a code defect the Dev Agent can fix by replanning —
+                # escalate immediately instead of burning the single SM/Dev/QA retry on it.
+                logger.warning("qa.test_env_issue", round=round_n)
+                return AgentResult(
+                    status="failed",
+                    output_artifacts=refs,
+                    next_event="qa.env_blocked",
+                    errors=[f"QA blocked by a test-environment issue (not a code defect): {analysis.get('summary', '')}"],
+                    human_approval_required=True,
+                )
+
             if verdict == "FAIL":
-                if retry < 1:
+                if round_n < 1:
+                    logger.info("agent.completed", status="failed", next_event="qa.failed", verdict=verdict)
                     return AgentResult(
                         status="failed",
                         output_artifacts=refs,
@@ -171,6 +204,7 @@ Classify defects, validate DoD, and produce verdict."""
                         human_approval_required=False,
                     )
                 else:
+                    logger.info("agent.completed", status="failed", next_event="qa.failed", verdict=verdict)
                     return AgentResult(
                         status="failed",
                         output_artifacts=refs,
@@ -179,6 +213,7 @@ Classify defects, validate DoD, and produce verdict."""
                         human_approval_required=True,
                     )
 
+            logger.info("agent.completed", status="success", next_event="qa.success", verdict=verdict)
             return AgentResult(
                 status="success",
                 output_artifacts=refs,
@@ -187,12 +222,15 @@ Classify defects, validate DoD, and produce verdict."""
             )
 
         except Exception as exc:
+            logger.error("agent.failed", error=str(exc))
             return AgentResult(
                 status="failed",
                 errors=[str(exc)],
                 next_event="qa.failed",
                 human_approval_required=True,
             )
+        finally:
+            structlog.contextvars.unbind_contextvars("agent")
 
 
 def _load_json(base: str, wf: str, agent: str, name: str):

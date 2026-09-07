@@ -104,6 +104,21 @@ Raw Feature Request
 - Auto `npm install` in orchestrator when `package.json` is modified
 - Error messages surfaced in CLI summary output
 
+### ✅ Phase 16 — E2E test-driven bug fixes (live run against operations-dashboard)
+- **QA stderr capture** — `test_results.json` now persists `shell_result.error`, and the QA analysis LLM receives it. Previously discarded, leaving QA to guess at failures from an empty result.
+- **QA environment-issue short-circuit** — QA detects "missing script"/"command not found"/"cannot find module" in test-runner stderr and returns `next_event="qa.env_blocked"`. The engine escalates straight to `HUMAN_APPROVAL_REQUIRED` instead of burning the single SM/Dev retry on a test-environment problem Dev Agent cannot fix.
+- **Per-round artifact history** — `core/artifacts.py` adds `archive_agent_name()`. SM/QA/Dev agents now also write a snapshot to `<agent>/history/round{N}/<name>` alongside the canonical (still-overwritten) file, so a QA retry no longer destroys the prior round's evidence.
+- **One PR per workflow round, not one per Dev task** — `dev/orchestrator.py` split into `plan_and_edit()` (plan + file edits, no git/build/PR) and the original `run_agent()` (unchanged standalone single-PR pipeline for root `agent.py`). `DevAgent.run()` now plans every task, then performs exactly one `npm install`/build/branch/commit/push/PR per round via `_ship_single_pr()`.
+- **Fixed `cmd_status`** — the CLI's `status` subcommand had a body with no enclosing `def`, causing a `NameError` if ever invoked. Restored as a proper function.
+- **Wired approval finalization** — `POAgent.finalize_approved()` and the `APPROVED → DONE` transition were previously unused dead code. Added `WorkflowEngine.finalize_approval()` (release notes + product catalog refresh + gated DevOps/Prod checklist generation + `APPROVED → DONE`). `cmd_approve` now checks `qa_signoff.json`'s verdict and calls `finalize_approval()` directly when QA already passed, instead of needlessly re-running SM/Dev/QA.
+
+### ✅ Phase 17 — Structured logging (structlog)
+- `structlog>=24` added as a dependency; new `observability/logging.py` module.
+- `configure_logging()` — console renderer by default (`AXON_LOG_FORMAT=console|json`), always additionally persists JSON lines to `artifacts/<workflow_id>/engine/run.log.jsonl` once a workflow's `workflow_id` is bound.
+- `bind_workflow_context()` / `clear_workflow_context()` (structlog `contextvars`) carry `workflow_id`, `agent`, `round` (retry_count), and `task_id` (Dev Agent) through every log call without threading a logger object through function signatures.
+- Instrumented: `WorkflowEngine` (every `set_status()` transition, workflow start/finish), PO/SM/QA/Dev agents' own `run()` overrides (agent start/complete/fail, since none of them use `BaseAgent.run()`'s template method), every `BaseAgent.call_llm()` call, all 4 tool modules (`shell_executor`, `git_tools`, `github_tools`, `validator_tools`), and `LocalArtifactStore.save()`.
+- Secrets and raw LLM prompts/responses are never logged — only lengths/latency/booleans. A `_redact_sensitive` processor redacts any field whose key matches `api_key`/`token`/`secret`/`password`/`authorization` as a defense-in-depth measure (word-boundary matched so it doesn't false-positive on fields like `max_tokens`).
+
 ---
 
 ## Deferred

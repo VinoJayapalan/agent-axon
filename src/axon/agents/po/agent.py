@@ -4,14 +4,19 @@ import json
 from pathlib import Path
 from typing import Any
 
+import structlog
+
 from axon.agents.base import BaseAgent
 from axon.agents.po.prompts import ASSESSMENT_SYSTEM, CATALOG_REFRESH_SYSTEM, RELEASE_NOTES_SYSTEM
 from axon.agents.po.schemas import POOutput, UserStory
 from axon.config.settings import settings
 from axon.core.errors import LLMValidationError
 from axon.core.events import Event
+from axon.observability.logging import get_logger
 from axon.tools.repo_tools import list_repo_files
 from axon.tools.file_tools import read_file
+
+logger = get_logger(__name__)
 
 
 class POAgent(BaseAgent):
@@ -128,7 +133,8 @@ Evaluate this request and return the required JSON."""
     # ------------------------------------------------------------------ #
 
     def finalize_approved(self, workflow_id: str, qa_signoff: dict) -> None:
-        """Called by engine after APPROVED. Validates stories and writes release notes."""
+        """Called by engine after APPROVED. Validates stories, writes release notes,
+        and refreshes the product catalog so it reflects the just-shipped feature."""
         stories = self._state_store.list_user_stories(workflow_id)
         for story in stories:
             self._state_store.update_user_story_status(story["story_id"], "DONE")
@@ -137,6 +143,7 @@ Evaluate this request and return the required JSON."""
         self._artifact_store.save(
             workflow_id, "po", "release_notes.json", json.dumps(release_notes, indent=2)
         )
+        self._refresh_catalog(workflow_id)
 
     def _generate_release_notes(self, workflow_id: str, qa_signoff: dict) -> dict:
         stories = self._state_store.list_user_stories(workflow_id)
@@ -252,6 +259,8 @@ Extract the product catalog."""
 
     def run(self, event: Event):
         self._check_permissions()
+        structlog.contextvars.bind_contextvars(agent=self.name)
+        logger.info("agent.started")
         try:
             context = self.load_context(event)
             prompt = self.build_prompt(context)
@@ -260,7 +269,16 @@ Extract the product catalog."""
             artifacts = self.persist_artifacts(validated, event)
             next_event = "po.ambiguous" if validated.get("human_approval_required") else "po.success"
 
+            if next_event == "po.ambiguous":
+                logger.warning(
+                    "po.request_ambiguous",
+                    is_ambiguous=validated.get("is_ambiguous", False),
+                    risk_level=validated.get("risk_level"),
+                    open_questions=validated.get("open_questions", []),
+                )
+
             from axon.core.results import AgentResult
+            logger.info("agent.completed", status="success", next_event=next_event)
             return AgentResult(
                 status="success",
                 output_artifacts=artifacts,
@@ -269,9 +287,12 @@ Extract the product catalog."""
             )
         except Exception as exc:
             from axon.core.results import AgentResult
+            logger.error("agent.failed", error=str(exc))
             return AgentResult(
                 status="failed",
                 errors=[str(exc)],
                 next_event="po.failed",
                 human_approval_required=True,
             )
+        finally:
+            structlog.contextvars.unbind_contextvars("agent")

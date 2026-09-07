@@ -1,6 +1,10 @@
 import subprocess
 from dataclasses import dataclass
 
+from axon.observability.logging import get_logger
+
+logger = get_logger(__name__)
+
 
 @dataclass
 class BuildResult:
@@ -19,18 +23,22 @@ def run_build(repo_path: str) -> BuildResult:
             text=True,
             timeout=120,
         )
-        return BuildResult(
+        build_result = BuildResult(
             success=result.returncode == 0,
             output=result.stdout.strip(),
             error=result.stderr.strip(),
         )
+        logger.info("tool.invoked", tool="npm_build", success=build_result.success)
+        return build_result
     except subprocess.TimeoutExpired:
+        logger.warning("tool.invoked", tool="npm_build", success=False, error="timeout")
         return BuildResult(
             success=False,
             output="",
             error="Build timed out after 120 seconds.",
         )
     except FileNotFoundError:
+        logger.warning("tool.invoked", tool="npm_build", success=False, error="npm not found")
         return BuildResult(
             success=False,
             output="",

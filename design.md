@@ -1,7 +1,7 @@
 # Axon — System Design
 
-**Version:** 1.0 (MVP)  
-**Last updated:** 2026-06-11  
+**Version:** 1.1 (post-E2E bug fixes + structured logging)  
+**Last updated:** 2026-09-06  
 **Package:** `src/axon/`  
 **Entry point:** `python -m axon.cli.main run "<request>"`
 
@@ -32,10 +32,14 @@ User Request (CLI)
                                               QA PASS ──▶ HUMAN_APPROVAL_REQUIRED
                                               QA FAIL ──▶ SM replan (1 retry)
                                               QA FAIL×2 ──▶ HUMAN_APPROVAL_REQUIRED
+                                              QA ENV_BLOCKED ──▶ HUMAN_APPROVAL_REQUIRED (immediate, no retry)
 ```
 
 After QA passes the workflow always stops at `HUMAN_APPROVAL_REQUIRED`.  
-Approving advances to `APPROVED → DONE` (DevOps/Prod are placeholder agents).
+Approving advances to `APPROVED → DONE` (DevOps/Prod are placeholder agents).  
+If QA has already passed, approving calls `WorkflowEngine.finalize_approval()` directly
+(release notes + product catalog refresh + DevOps/Prod checklists + `DONE`) instead of
+re-running SM/Dev/QA.
 
 ---
 
@@ -109,6 +113,9 @@ agent-axon/
       claude.py  ← ClaudeProvider (direct HTTP, no SDK)
       fake.py    ← FakeLLMProvider (substring-match dict, for tests)
 
+    observability/
+      logging.py ← structlog configuration, context binding, redaction, per-workflow JSON log file
+
     stores/
       artifact_store.py        ← ArtifactStore Protocol
       local_artifact_store.py  ← Writes to artifacts/<wf_id>/<agent>/<name>
@@ -158,6 +165,7 @@ DEV_IN_PROGRESS
 
 QA_IN_PROGRESS
   ├─ qa.success ──▶ QA_COMPLETED ──*──▶ HUMAN_APPROVAL_REQUIRED
+  ├─ qa.env_blocked ──▶ HUMAN_APPROVAL_REQUIRED  (test-environment issue, not a code defect — no retry consumed)
   └─ qa.failed  ──▶ QA_FAILED
                      ├─ retry=0 ──▶ SM_IN_PROGRESS  (replan + re-dev)
                      └─ retry=1 ──▶ HUMAN_APPROVAL_REQUIRED
@@ -186,24 +194,25 @@ HUMAN_APPROVAL_REQUIRED
 
 ```
 For each task in SM execution_plan:
-  1. plan_change(requirement, repo_files, file_previews)
-       → AgentPlan { summary, relevant_files, new_files, suggested_change }
+  1. plan_and_edit(requirement)
+       → plan_change()  → AgentPlan { summary, relevant_files, new_files, suggested_change }
+       → generate_edits() → For each relevant_file: edit prompt  → apply minimal diff
+                            For each new_file:      create prompt → write from scratch
+       (no git/build/PR side effects — safe to call per task)
 
-  2. generate_edits(requirement, plan, file_contents)
-       → For each relevant_file: edit prompt  → apply minimal diff
-       → For each new_file:      create prompt → write from scratch
-
-  3. npm install  (if package.json was modified)
-
-  4. npm run build  → PASS / FAIL
-
-  5. On PASS: git checkout -b <branch>
-              git commit
-              git push
-              GitHub PR created
+After ALL tasks in the round have been planned/edited:
+  2. npm install  (once, if any package.json was modified)
+  3. npm run build  → PASS / FAIL (once, across all accumulated edits)
+  4. On PASS: _ship_single_pr() — ONE branch/commit/push/PR for the whole round
+              (branch name includes `-r{round}` suffix on retries)
 ```
 
-Key fix: `new_files` field in `AgentPlan` enables the agent to create files that don't yet exist, resolving the previous single-file limitation.
+Key fixes:
+- `new_files` field in `AgentPlan` enables the agent to create files that don't yet exist.
+- Consolidated to **one PR per workflow round** (not one per task) — `plan_and_edit()` in
+  `dev/orchestrator.py` separates planning/editing from git/build/PR, and `DevAgent._ship_single_pr()`
+  ships everything from that round together. The standalone `agent.py` CLI still uses the original
+  `run_agent()` (one PR per single ad-hoc requirement) unaffected by this change.
 
 ---
 
@@ -211,16 +220,22 @@ Key fix: `new_files` field in `AgentPlan` enables the agent to create files that
 
 ### Artifacts (`artifacts/<workflow_id>/`)
 ```
-engine/  raw_request.txt
+engine/  raw_request.txt  run.log.jsonl
 po/      prd.json  user_stories.json  acceptance_criteria.json
          feasibility_report.json  open_questions.json  [release_notes.json]
 sm/      sprint_goal.json  task_breakdown.json  execution_plan.json
          dependency_graph.json  risk_notes.json  sprint_progress_summary.json
+         history/round{N}/  ← per-retry-round snapshot, never overwritten
 dev/     dev_output_task_1.json … dev_output_task_N.json
+         history/round{N}/  ← per-retry-round snapshot, never overwritten
 qa/      test_cases.json  test_results.json  defect_report.json  qa_signoff.json
+         history/round{N}/  ← per-retry-round snapshot, never overwritten
 devops/  devops_assessment.json
 prod/    prod_release_gate.json
 ```
+The canonical (non-`history/`) files are still overwritten on each SM/Dev/QA retry round;
+the `history/round{N}/` copies preserve every round's outputs for audit, written via
+`core.artifacts.archive_agent_name()`.
 
 ### SQLite tables (`data/axon.db`)
 | Table | Key columns |
@@ -240,4 +255,23 @@ prod/    prod_release_gate.json
 | Agent permissions | `AGENT_PERMISSIONS` dict — enforced in `BaseAgent._check_permissions()` |
 | Production gate | `DevOpsAgent` and `ProdAgent` always set `human_approval_required=True` |
 | No secrets in artifacts | API keys read from env vars only; never written to files |
+| No secrets in logs | `observability/logging.py`'s `_redact_sensitive` processor redacts any field matching `api_key`/`token`/`secret`/`password`/`authorization`; raw LLM prompts/responses are never logged, only lengths |
 | Blocked commands | `rm -rf`, `terraform`, `kubectl`, `sudo`, `git push origin main`, etc. |
+
+---
+
+## Observability
+
+Structured logging via `structlog`, configured once at process start (`configure_logging()` in
+`cli/main.py` and `agent.py`):
+
+- **Correlation fields**, bound via `structlog.contextvars`: `workflow_id` (always), `agent`
+  (bound per agent `run()`), `round` (SM/Dev/QA retry_count), `task_id` (Dev Agent, per task).
+- **Destinations**: console (`ConsoleRenderer`, default) or JSON to stdout (`AXON_LOG_FORMAT=json`),
+  and always a JSON-lines file at `artifacts/<workflow_id>/engine/run.log.jsonl` once `workflow_id`
+  is bound — lives alongside that workflow's other artifacts for post-hoc inspection.
+- **What's logged**: workflow start/finish, every `set_status()` transition, agent start/complete/fail,
+  every LLM call (prompt/response length + latency, never content), every shell/git/GitHub/build tool
+  invocation (command + success + duration, never credentials), every artifact write (path + byte count).
+- **What's excluded**: raw LLM prompts/responses, file contents, secrets/tokens (redacted defense-in-depth
+  even if accidentally passed).

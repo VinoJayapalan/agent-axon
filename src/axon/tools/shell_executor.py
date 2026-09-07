@@ -3,7 +3,10 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass
 
+from axon.observability.logging import get_logger
 from axon.policies.command_policy import CommandPolicy
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -36,13 +39,16 @@ class ShellExecutor:
                 text=True,
                 timeout=120,
             )
-            return ShellResult(
+            shell_result = ShellResult(
                 success=result.returncode == 0,
                 output=result.stdout.strip(),
                 error=result.stderr.strip(),
                 command=cmd,
             )
+            logger.info("tool.invoked", tool="shell", command=cmd, success=shell_result.success)
+            return shell_result
         except subprocess.TimeoutExpired:
+            logger.warning("tool.invoked", tool="shell", command=cmd, success=False, error="timeout")
             return ShellResult(
                 success=False,
                 output="",

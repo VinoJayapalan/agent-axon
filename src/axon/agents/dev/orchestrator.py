@@ -1,15 +1,20 @@
 import re
+import subprocess
+from dataclasses import dataclass, field
 
 from axon.config.settings import TARGET_REPO_PATH
 from axon.agents.dev.model_adapter import get_model_adapter
+from axon.observability.logging import get_logger
 from axon.tools.file_tools import read_file, write_file
 from axon.tools.git_tools import commit_changes, create_branch, push_branch
 from axon.tools.github_tools import create_pull_request
 from axon.tools.repo_tools import list_repo_files
 from axon.tools.validator_tools import run_build
 
+logger = get_logger(__name__)
 
-def _slugify(text: str, max_length: int = 50) -> str:
+
+def slugify(text: str, max_length: int = 50) -> str:
     """Convert a requirement string into a safe git branch name."""
     slug = text.lower()
     slug = re.sub(r"[^a-z0-9]+", "-", slug)
@@ -17,7 +22,37 @@ def _slugify(text: str, max_length: int = 50) -> str:
     return f"axon/{slug}"
 
 
-def run_agent(requirement: str) -> str:
+# Back-compat alias for the previous private name.
+_slugify = slugify
+
+
+def run_npm_install(target_repo_path: str = TARGET_REPO_PATH) -> str | None:
+    """Run `npm install`. Returns an error message string on failure, else None."""
+    logger.info("tool.invoked", tool="npm_install")
+    result = subprocess.run(
+        ["npm", "install"],
+        cwd=target_repo_path,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    success = result.returncode == 0
+    logger.info("tool.invoked", tool="npm_install", success=success)
+    if not success:
+        return result.stderr[:500]
+    return None
+
+
+@dataclass
+class PlanEditResult:
+    plan_summary: str
+    relevant_files: list[str] = field(default_factory=list)
+    edited_files: list[str] = field(default_factory=list)
+    suggested_change: str = ""
+
+
+def plan_and_edit(requirement: str) -> PlanEditResult:
+    """Plan and apply file edits for a single requirement — no git/build/PR side effects."""
     files = list_repo_files(TARGET_REPO_PATH, limit=300)
 
     source_files = [
@@ -35,8 +70,6 @@ def run_agent(requirement: str) -> str:
     adapter = get_model_adapter()
     plan = adapter.plan_change(requirement, source_files, file_previews)
 
-    relevant = "\n".join(plan.relevant_files) if plan.relevant_files else "(none identified)"
-
     full_file_contents: dict[str, str] = {}
     for file in plan.relevant_files:
         full_path = f"{TARGET_REPO_PATH}/{file}"
@@ -53,11 +86,29 @@ def run_agent(requirement: str) -> str:
         write_file(full_path, edit.new_content)
         edited_files.append(edit.path)
 
+    return PlanEditResult(
+        plan_summary=plan.summary,
+        relevant_files=plan.relevant_files,
+        edited_files=edited_files,
+        suggested_change=plan.suggested_change,
+    )
+
+
+def run_agent(requirement: str) -> str:
+    """Standalone single-requirement pipeline: plan, edit, build, and open one PR.
+
+    Used by the root `agent.py` CLI. The SDLC pipeline's DevAgent uses
+    `plan_and_edit()` directly so it can consolidate multiple tasks into one PR.
+    """
+    result = plan_and_edit(requirement)
+    relevant = "\n".join(result.relevant_files) if result.relevant_files else "(none identified)"
+    edited_files = result.edited_files
+
     output = (
         f"Requirement: {requirement}\n\n"
-        f"Plan summary: {plan.summary}\n\n"
+        f"Plan summary: {result.plan_summary}\n\n"
         f"Relevant files:\n{relevant}\n\n"
-        f"Suggested change:\n{plan.suggested_change}"
+        f"Suggested change:\n{result.suggested_change}"
     )
 
     if edited_files:
@@ -65,17 +116,9 @@ def run_agent(requirement: str) -> str:
 
         # If package.json was modified, install new dependencies first
         if any("package.json" in f and "lock" not in f for f in edited_files):
-            import subprocess
-            print("package.json changed — running npm install...")
-            npm_result = subprocess.run(
-                ["npm", "install"],
-                cwd=TARGET_REPO_PATH,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            if npm_result.returncode != 0:
-                output += f"\n\nnpm install failed:\n{npm_result.stderr[:500]}"
+            install_error = run_npm_install(TARGET_REPO_PATH)
+            if install_error:
+                output += f"\n\nnpm install failed:\n{install_error}"
                 return output
 
         print("Running build validation...")
@@ -84,11 +127,11 @@ def run_agent(requirement: str) -> str:
         if build.success:
             output += "\n\nBuild: ✅ PASSED"
 
-            branch_name = _slugify(requirement)
+            branch_name = slugify(requirement)
             commit_msg = f"feat: {requirement[:72]}"
             pr_body = (
-                f"## Summary\n{plan.summary}\n\n"
-                f"## Change\n{plan.suggested_change}\n\n"
+                f"## Summary\n{result.plan_summary}\n\n"
+                f"## Change\n{result.suggested_change}\n\n"
                 f"## Files edited\n"
                 + "\n".join(f"- `{f}`" for f in edited_files)
                 + "\n\n_Opened by Axon_"

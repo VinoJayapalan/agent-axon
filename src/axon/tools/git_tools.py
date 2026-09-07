@@ -1,6 +1,10 @@
 import subprocess
 from dataclasses import dataclass
 
+from axon.observability.logging import get_logger
+
+logger = get_logger(__name__)
+
 
 @dataclass
 class GitResult:
@@ -39,7 +43,9 @@ def create_branch(repo_path: str, branch_name: str) -> GitResult:
         delete = _run(["git", "branch", "-D", branch_name], cwd=repo_path)
         if not delete.success:
             return delete
-    return _run(["git", "checkout", "-b", branch_name], cwd=repo_path)
+    result = _run(["git", "checkout", "-b", branch_name], cwd=repo_path)
+    logger.info("tool.invoked", tool="git_create_branch", branch=branch_name, success=result.success)
+    return result
 
 
 def commit_changes(repo_path: str, files: list[str], message: str) -> GitResult:
@@ -47,9 +53,13 @@ def commit_changes(repo_path: str, files: list[str], message: str) -> GitResult:
     stage = _run(["git", "add", "--"] + files, cwd=repo_path)
     if not stage.success:
         return stage
-    return _run(["git", "commit", "-m", message], cwd=repo_path)
+    result = _run(["git", "commit", "-m", message], cwd=repo_path)
+    logger.info("tool.invoked", tool="git_commit", file_count=len(files), success=result.success)
+    return result
 
 
 def push_branch(repo_path: str, branch_name: str) -> GitResult:
     """Push the branch to origin."""
-    return _run(["git", "push", "origin", branch_name], cwd=repo_path)
+    result = _run(["git", "push", "origin", branch_name], cwd=repo_path)
+    logger.info("tool.invoked", tool="git_push", branch=branch_name, success=result.success)
+    return result

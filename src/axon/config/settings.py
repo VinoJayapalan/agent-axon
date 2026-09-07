@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     axon_db_path: str = "data/axon.db"
     artifacts_base_path: str = "artifacts/"
 
+    log_format: str = "console"  # "console" or "json"
+    log_level: str = "INFO"
+
 
 settings = Settings()
 

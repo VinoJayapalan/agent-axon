@@ -4,13 +4,19 @@ import json
 from pathlib import Path
 from typing import Any
 
+import structlog
+
 from axon.agents.base import BaseAgent
 from axon.agents.sm.prompts import SM_SYSTEM
 from axon.agents.sm.schemas import SMOutput, Task
 from axon.config.settings import settings
+from axon.core.artifacts import archive_agent_name
 from axon.core.errors import LLMValidationError
 from axon.core.events import Event
+from axon.observability.logging import get_logger
 from axon.tools.shell_executor import ShellExecutor
+
+logger = get_logger(__name__)
 
 
 class ScrumMasterAgent(BaseAgent):
@@ -65,6 +71,7 @@ class ScrumMasterAgent(BaseAgent):
 
     def persist_artifacts(self, validated: dict[str, Any], event: Event) -> list:
         wf = event.workflow_id
+        round_n = event.retry_count
         refs = []
         for name, key in [
             ("sprint_goal.json", "sprint_goal"),
@@ -75,6 +82,8 @@ class ScrumMasterAgent(BaseAgent):
         ]:
             content = json.dumps(validated.get(key, {}), indent=2)
             refs.append(self._artifact_store.save(wf, "sm", name, content))
+            # Archive a per-round snapshot so a replan doesn't silently erase the prior round's plan.
+            self._artifact_store.save(wf, archive_agent_name("sm", round_n), name, content)
 
         # Update user stories to IN_PROGRESS
         for story in self._state_store.list_user_stories(wf):
@@ -87,6 +96,8 @@ class ScrumMasterAgent(BaseAgent):
 
     def run(self, event: Event) -> Any:
         self._check_permissions()
+        structlog.contextvars.bind_contextvars(agent=self.name)
+        logger.info("agent.started")
         context = self.load_context(event)
 
         # Pre-flight: git status
@@ -96,6 +107,8 @@ class ScrumMasterAgent(BaseAgent):
                 result = executor.run("git status")
                 if not result.success:
                     from axon.core.results import AgentResult
+                    logger.error("agent.failed", error=f"Pre-flight git status failed: {result.error}")
+                    structlog.contextvars.unbind_contextvars("agent")
                     return AgentResult(
                         status="failed",
                         errors=[f"Pre-flight git status failed: {result.error}"],
@@ -113,6 +126,7 @@ class ScrumMasterAgent(BaseAgent):
             next_event = "sm.failed" if validated.get("human_approval_required") else "sm.success"
 
             from axon.core.results import AgentResult
+            logger.info("agent.completed", status="success" if next_event == "sm.success" else "failed", next_event=next_event)
             return AgentResult(
                 status="success" if next_event == "sm.success" else "failed",
                 output_artifacts=artifacts,
@@ -121,12 +135,15 @@ class ScrumMasterAgent(BaseAgent):
             )
         except Exception as exc:
             from axon.core.results import AgentResult
+            logger.error("agent.failed", error=str(exc))
             return AgentResult(
                 status="failed",
                 errors=[str(exc)],
                 next_event="sm.failed",
                 human_approval_required=True,
             )
+        finally:
+            structlog.contextvars.unbind_contextvars("agent")
 
     @staticmethod
     def _load_json(base: str, wf: str, agent: str, name: str):
